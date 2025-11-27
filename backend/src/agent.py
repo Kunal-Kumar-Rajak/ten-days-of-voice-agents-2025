@@ -1,194 +1,277 @@
-"""
-Day 6 – Fraud Detection Agent
-"""
 
-import json
+import logging
 import os
-from dataclasses import dataclass, field
-from typing import Optional, Annotated
-from pydantic import Field
+import sqlite3
 from datetime import datetime
+from typing import Annotated, Optional
+from dataclasses import dataclass
 
+from dotenv import load_dotenv
+from pydantic import Field
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
-    RunContext,
-    WorkerOptions,
     RoomInputOptions,
+    WorkerOptions,
+    cli,
     function_tool,
-    cli
+    RunContext,
 )
 
-from livekit.plugins import google, deepgram, murf, silero, noise_cancellation
+from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-FRAUD_DB_FILE = "shared-data/fraud_db.json"
+logger = logging.getLogger("agent")
+load_dotenv(".env.local")
 
+# ======================================================
+# 💾 1. DATABASE SETUP (SQLite)
+# ======================================================
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def load_db():
-    if not os.path.exists(FRAUD_DB_FILE):
-        return []
-    with open(FRAUD_DB_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_db(data):
-    with open(FRAUD_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-# ---------------------------
-# User / Case state
-# ---------------------------
-@dataclass
-class ActiveCase:
-    record: Optional[dict] = None
-    verified: bool = False
-
+DB_FILE = "fraud_db.sqlite"
 
 @dataclass
-class UserState:
-    active_case: ActiveCase = field(default_factory=ActiveCase)
-    agent_session: Optional[AgentSession] = None
+class FraudCase:
+    userName: str
+    securityIdentifier: str
+    cardEnding: str
+    transactionName: str
+    transactionAmount: str
+    transactionTime: str
+    transactionSource: str
+    case_status: str = "pending_review"
+    notes: str = ""
 
 
-# ---------------------------
-# Tools
-# ---------------------------
+def get_db_path():
+    return os.path.join(os.path.dirname(__file__), DB_FILE)
+
+
+def get_conn():
+    path = get_db_path()
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def seed_database():
+    """Create SQLite DB and insert sample rows if empty."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # ✅ FIXED SQL — CLEAN, NO BROKEN LINES
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fraud_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            userName TEXT NOT NULL,
+            securityIdentifier TEXT,
+            cardEnding TEXT,
+            transactionName TEXT,
+            transactionAmount TEXT,
+            transactionTime TEXT,
+            transactionSource TEXT,
+            case_status TEXT DEFAULT 'pending_review',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+    cur.execute("SELECT COUNT(1) FROM fraud_cases")
+    if cur.fetchone()[0] == 0:
+        sample_data = [
+            (
+                "Kunal", "12345", "4242",
+                "Bhagalpur collage of engg", "$500.00", "1:30 AM EST", "google.com",
+                "pending_review", "Automated flag: High value transaction."
+            ),
+            (
+                "Badal", "99887", "1199",
+                "Purnia collage of engg", "$3,500.00", "2:15 AM PST", "online_transfer",
+                "pending_review", "Automated flag: Unusual location."
+            )
+        ]
+        cur.executemany(
+            """
+            INSERT INTO fraud_cases (
+                userName, securityIdentifier, cardEnding, transactionName,
+                transactionAmount, transactionTime, transactionSource, case_status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            sample_data,
+        )
+        conn.commit()
+        print(f"✅ SQLite DB seeded at {DB_FILE}")
+
+    conn.close()
+
+
+# Initialize DB on load
+seed_database()
+
+# ======================================================
+# 🧠 2. STATE MANAGEMENT
+# ======================================================
+
+@dataclass
+class Userdata:
+    active_case: Optional[FraudCase] = None
+
+# ======================================================
+# 🛠️ 3. FRAUD AGENT TOOLS (SQLite-backed)
+# ======================================================
+
 @function_tool
-async def lookup_customer(ctx: RunContext[UserState], name: Annotated[str, Field(description="Customer name")]) -> str:
-    db = load_db()
-    found = next((entry for entry in db if entry["userName"].lower() == name.lower()), None)
+async def lookup_customer(
+    ctx: RunContext[Userdata],
+    name: Annotated[str, Field(description="The name the user provides")],
+) -> str:
+    """Lookup a customer in SQLite DB."""
+    print(f"🔎 LOOKING UP: {name}")
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
 
-    if not found:
-        return "User not found. Please ask them to check their name."
+        cur.execute(
+            "SELECT * FROM fraud_cases WHERE LOWER(userName) = LOWER(?) LIMIT 1",
+            (name,),
+        )
+        row = cur.fetchone()
+        conn.close()
 
-    ctx.userdata.active_case.record = found
-    return f"Found user {found['userName']}. Ask for the security identifier."
+        if not row:
+            return "User not found in the fraud database. Please repeat the name."
 
+        record = dict(row)
+        ctx.userdata.active_case = FraudCase(
+            userName=record["userName"],
+            securityIdentifier=record["securityIdentifier"],
+            cardEnding=record["cardEnding"],
+            transactionName=record["transactionName"],
+            transactionAmount=record["transactionAmount"],
+            transactionTime=record["transactionTime"],
+            transactionSource=record["transactionSource"],
+            case_status=record["case_status"],
+            notes=record["notes"],
+        )
 
-@function_tool
-async def verify_security(ctx: RunContext[UserState], identifier: Annotated[str, Field(description="Security identifier")]) -> str:
-    case = ctx.userdata.active_case.record
-    if not case:
-        return "No case loaded."
+        return (
+            f"Record Found.\n"
+            f"User: {record['userName']}\n"
+            f"Security ID (Expected): {record['securityIdentifier']}\n"
+            f"Transaction: {record['transactionAmount']} at {record['transactionName']} ({record['transactionSource']})\n"
+            f"Ask user for their Security Identifier now."
+        )
 
-    if identifier.strip() == case["securityIdentifier"]:
-        ctx.userdata.active_case.verified = True
-        return f"Security identifier correct. Now ask the security question: {case['securityQuestion']}"
-    else:
-        return "Invalid security identifier. Politely end the call."
-
-
-@function_tool
-async def verify_security_answer(ctx: RunContext[UserState], user_answer: Annotated[str, Field(description="Security question answer")]) -> str:
-    case = ctx.userdata.active_case.record
-    if not case:
-        return "No case loaded."
-
-    if user_answer.lower().strip() == case["securityAnswer"].lower().strip():
-        ctx.userdata.active_case.verified = True
-        return "Identity verified. Now proceed to explain the suspicious transaction."
-    else:
-        return "Security answer incorrect. End the call."
+    except Exception as e:
+        return f"Database error: {str(e)}"
 
 
 @function_tool
 async def resolve_fraud_case(
-    ctx: RunContext[UserState],
-    status: Annotated[str, Field(description="'confirmed_fraud' or 'safe_transaction'")]
+    ctx: RunContext[Userdata],
+    status: Annotated[str, Field(description="confirmed_safe or confirmed_fraud")],
+    notes: Annotated[str, Field(description="Notes on the user's confirmation")],
 ) -> str:
-    case = ctx.userdata.active_case.record
-    if not case:
-        return "No case loaded."
 
-    db = load_db()
-    for entry in db:
-        if entry["userName"] == case["userName"]:
-            entry["case_status"] = status
-            entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+    if not ctx.userdata.active_case:
+        return "Error: No active case selected."
 
-    save_db(db)
+    case = ctx.userdata.active_case
+    case.case_status = status
+    case.notes = notes
 
-    if status == "confirmed_fraud":
-        return "Case marked as FRAUD. Assure user their card will be blocked and new card issued."
-    else:
-        return "Case marked SAFE. Transaction confirmed."
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
 
-# ---------------------------
-# Agent
-# ---------------------------
+        cur.execute(
+            """
+            UPDATE fraud_cases
+            SET case_status = ?, notes = ?, updated_at = datetime('now')
+            WHERE userName = ?
+            """,
+            (case.case_status, case.notes, case.userName),
+        )
+        conn.commit()
+
+        # Confirm updated row
+        cur.execute("SELECT * FROM fraud_cases WHERE userName = ?", (case.userName,))
+        updated_row = dict(cur.fetchone())
+        conn.close()
+
+        print(f"✅ CASE UPDATED: {case.userName} -> {status}")
+
+        if status == "confirmed_fraud":
+            return (
+                f"Fraud confirmed. Card ending {case.cardEnding} is now BLOCKED. "
+                f"A replacement card will be issued.\n"
+                f"DB Updated At: {updated_row['updated_at']}"
+            )
+        else:
+            return (
+                f"Transaction marked SAFE. Restrictions lifted.\n"
+                f"DB Updated At: {updated_row['updated_at']}"
+            )
+
+    except Exception as e:
+        return f"Error saving to DB: {e}"
+
+# ======================================================
+# 🤖 4. AGENT DEFINITION
+# ======================================================
+
 class FraudAgent(Agent):
     def __init__(self):
         super().__init__(
             instructions="""
-You are a calm, professional Fraud Detection Specialist from Global Bank.
+            You are 'Alex', a Fraud Detection Specialist at Dr Abhishek Bank.
+            Follow strict security protocol:
 
-PHASE 1 – Greeting  
-• Introduce yourself. Ask for the customer's full name.
-
-PHASE 2 – Case Lookup  
-• Call lookup_customer(name).
-
-PHASE 3 – Security Verification  
-• Ask for the security identifier.  
-• Call verify_security(identifier).  
-• If correct → Ask the stored security question.  
-• Call verify_security_answer(answer).  
-• If incorrect → end call politely.
-
-PHASE 4 – Suspicious Transaction Review  
-• Read the stored suspicious transaction: name, amount, time, source.  
-• Ask: “Did you make this transaction?”
-
-PHASE 5 – Handle Response  
-If YES → call resolve_fraud_case("safe_transaction")  
-If NO → call resolve_fraud_case("confirmed_fraud")
-
-PHASE 6 – Close Call  
-• Thank them.  
-• Reassure next steps.
-
-— VERY IMPORTANT —  
-• Never ask for PIN, CVV, OTP, full card number, or any sensitive info.  
-• Only use the fields provided in the database.  
-"""
-            ,
-            tools=[lookup_customer, verify_security, verify_security_answer, resolve_fraud_case]
+            1. Greeting + ask for first name.
+            2. Immediately call lookup_customer(name).
+            3. Ask for Security Identifier.
+            4. If correct → continue. If incorrect → end call politely.
+            5. Explain suspicious transaction.
+            6. Ask: Did you make this transaction?
+               - YES → resolve_fraud_case('confirmed_safe')
+               - NO → resolve_fraud_case('confirmed_fraud')
+            7. Close professionally.
+            """,
+            tools=[lookup_customer, resolve_fraud_case],
         )
 
+# ======================================================
+# 🎬 ENTRYPOINT
+# ======================================================
 
-# ---------------------------
-# Prewarm
-# ---------------------------
 def prewarm(proc: JobProcess):
-    try:
-        proc.userdata["vad"] = silero.VAD.load()
-    except:
-        proc.userdata["vad"] = None
+    proc.userdata["vad"] = silero.VAD.load()
 
 
-# ---------------------------
-# Entrypoint
-# ---------------------------
 async def entrypoint(ctx: JobContext):
-    userdata = UserState()
+    ctx.log_context_fields = {"room": ctx.room.name}
+
+    print("🚀 STARTING FRAUD ALERT SESSION (SQLite)")
+
+    userdata = Userdata()
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
-        tts=murf.TTS(voice="en-US-matthew", style="Conversational"),
+        tts=murf.TTS(
+            voice="en-US-marcus",
+            style="Conversational",
+            text_pacing=True,
+        ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata.get("vad"),
+        vad=ctx.proc.userdata["vad"],
         userdata=userdata,
     )
-
-    userdata.agent_session = session
 
     await session.start(
         agent=FraudAgent(),
