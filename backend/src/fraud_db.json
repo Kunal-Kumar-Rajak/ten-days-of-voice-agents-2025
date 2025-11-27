@@ -1,0 +1,24 @@
+[
+    {
+        "userName": "Kunal",
+        "securityIdentifier": "56789",
+        "cardEnding": "7631",
+        "transactionName": "Bhagalpur collage of engg",
+        "transactionAmount": "$500.00",
+        "transactionTime": "1:30 AM EST",
+        "transactionSource": "google.com",
+        "case_status": "confirmed_fraud",
+        "notes": "User denied the transaction of $500.00 at Bhagalpur collage of engg (google.com)."
+    },
+    {
+        "userName": "Badal",
+        "securityIdentifier": "96933",
+        "cardEnding": "9798",
+        "transactionName": "Purnia Collage of engg",
+        "transactionAmount": "$3,500.00",
+        "transactionTime": "2:15 AM PST",
+        "transactionSource": "online_transfer",
+        "case_status": "pending_review",
+        "notes": "Automated flag: Unusual location."
+    }
+]
