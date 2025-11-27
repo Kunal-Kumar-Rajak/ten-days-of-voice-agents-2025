@@ -1,137 +1,201 @@
-import logging
+"""
+Day 6 – Fraud Detection Agent
+"""
 
-from dotenv import load_dotenv
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Optional, Annotated
+from pydantic import Field
+from datetime import datetime
+
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
-    RoomInputOptions,
+    RunContext,
     WorkerOptions,
-    cli,
-    metrics,
-    tokenize,
-    # function_tool,
-    # RunContext
+    RoomInputOptions,
+    function_tool,
+    cli
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+
+from livekit.plugins import google, deepgram, murf, silero, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
-
-load_dotenv(".env.local")
+FRAUD_DB_FILE = "shared-data/fraud_db.json"
 
 
-class Assistant(Agent):
-    def __init__(self) -> None:
+# ---------------------------
+# Helpers
+# ---------------------------
+def load_db():
+    if not os.path.exists(FRAUD_DB_FILE):
+        return []
+    with open(FRAUD_DB_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_db(data):
+    with open(FRAUD_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+# ---------------------------
+# User / Case state
+# ---------------------------
+@dataclass
+class ActiveCase:
+    record: Optional[dict] = None
+    verified: bool = False
+
+
+@dataclass
+class UserState:
+    active_case: ActiveCase = field(default_factory=ActiveCase)
+    agent_session: Optional[AgentSession] = None
+
+
+# ---------------------------
+# Tools
+# ---------------------------
+@function_tool
+async def lookup_customer(ctx: RunContext[UserState], name: Annotated[str, Field(description="Customer name")]) -> str:
+    db = load_db()
+    found = next((entry for entry in db if entry["userName"].lower() == name.lower()), None)
+
+    if not found:
+        return "User not found. Please ask them to check their name."
+
+    ctx.userdata.active_case.record = found
+    return f"Found user {found['userName']}. Ask for the security identifier."
+
+
+@function_tool
+async def verify_security(ctx: RunContext[UserState], identifier: Annotated[str, Field(description="Security identifier")]) -> str:
+    case = ctx.userdata.active_case.record
+    if not case:
+        return "No case loaded."
+
+    if identifier.strip() == case["securityIdentifier"]:
+        ctx.userdata.active_case.verified = True
+        return f"Security identifier correct. Now ask the security question: {case['securityQuestion']}"
+    else:
+        return "Invalid security identifier. Politely end the call."
+
+
+@function_tool
+async def verify_security_answer(ctx: RunContext[UserState], user_answer: Annotated[str, Field(description="Security question answer")]) -> str:
+    case = ctx.userdata.active_case.record
+    if not case:
+        return "No case loaded."
+
+    if user_answer.lower().strip() == case["securityAnswer"].lower().strip():
+        ctx.userdata.active_case.verified = True
+        return "Identity verified. Now proceed to explain the suspicious transaction."
+    else:
+        return "Security answer incorrect. End the call."
+
+
+@function_tool
+async def resolve_fraud_case(
+    ctx: RunContext[UserState],
+    status: Annotated[str, Field(description="'confirmed_fraud' or 'safe_transaction'")]
+) -> str:
+    case = ctx.userdata.active_case.record
+    if not case:
+        return "No case loaded."
+
+    db = load_db()
+    for entry in db:
+        if entry["userName"] == case["userName"]:
+            entry["case_status"] = status
+            entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+
+    save_db(db)
+
+    if status == "confirmed_fraud":
+        return "Case marked as FRAUD. Assure user their card will be blocked and new card issued."
+    else:
+        return "Case marked SAFE. Transaction confirmed."
+
+# ---------------------------
+# Agent
+# ---------------------------
+class FraudAgent(Agent):
+    def __init__(self):
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting including emojis, asterisks, or other weird symbols.
-            You are curious, friendly, and have a sense of humor.""",
+            instructions="""
+You are a calm, professional Fraud Detection Specialist from Global Bank.
+
+PHASE 1 – Greeting  
+• Introduce yourself. Ask for the customer's full name.
+
+PHASE 2 – Case Lookup  
+• Call lookup_customer(name).
+
+PHASE 3 – Security Verification  
+• Ask for the security identifier.  
+• Call verify_security(identifier).  
+• If correct → Ask the stored security question.  
+• Call verify_security_answer(answer).  
+• If incorrect → end call politely.
+
+PHASE 4 – Suspicious Transaction Review  
+• Read the stored suspicious transaction: name, amount, time, source.  
+• Ask: “Did you make this transaction?”
+
+PHASE 5 – Handle Response  
+If YES → call resolve_fraud_case("safe_transaction")  
+If NO → call resolve_fraud_case("confirmed_fraud")
+
+PHASE 6 – Close Call  
+• Thank them.  
+• Reassure next steps.
+
+— VERY IMPORTANT —  
+• Never ask for PIN, CVV, OTP, full card number, or any sensitive info.  
+• Only use the fields provided in the database.  
+"""
+            ,
+            tools=[lookup_customer, verify_security, verify_security_answer, resolve_fraud_case]
         )
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
 
-
+# ---------------------------
+# Prewarm
+# ---------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except:
+        proc.userdata["vad"] = None
 
 
+# ---------------------------
+# Entrypoint
+# ---------------------------
 async def entrypoint(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
+    userdata = UserState()
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=google.LLM(
-                model="gemini-2.5-flash",
-            ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=murf.TTS(
-                voice="en-US-matthew", 
-                style="Conversation",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
-            ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+        llm=google.LLM(model="gemini-2.5-flash"),
+        tts=murf.TTS(voice="en-US-matthew", style="Conversational"),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
+        vad=ctx.proc.userdata.get("vad"),
+        userdata=userdata,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
+    userdata.agent_session = session
 
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(),
+        agent=FraudAgent(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            # For telephony applications, use `BVCTelephony` for best results
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
 
-    # Join the room and connect to the user
     await ctx.connect()
 
 
