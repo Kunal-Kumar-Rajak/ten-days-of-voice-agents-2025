@@ -1,8 +1,23 @@
-import json
+"""
+Day 10 – Voice Improv Battle
+
+This agent acts as a host for a voice-only improv game.
+Updates:
+- Safe environment variable parsing.
+- Robust exception logging in prewarm and entrypoint.
+- Secure randomness for reaction logic.
+- Graceful handling of empty input.
+- Signal handling for cleanup.
+"""
+
 import logging
 import os
 import asyncio
 import uuid
+import secrets
+import re
+import signal
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Optional, Annotated
@@ -25,718 +40,372 @@ from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 # -------------------------
-# Logging
+# Configuration & Logging
 # -------------------------
-logger = logging.getLogger("voice_game_master")
+load_dotenv(".env.local")
+
+logger = logging.getLogger("voice_improv_battle")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
-load_dotenv(".env.local")
+# 1. Safe Config Parsing
+try:
+    DEFAULT_MAX_ROUNDS = int(os.getenv("IMPROV_MAX_ROUNDS", "3"))
+except (TypeError, ValueError):
+    logger.warning("Invalid IMPROV_MAX_ROUNDS env var; defaulting to 3.")
+    DEFAULT_MAX_ROUNDS = 3
 
+MAX_ROUNDS_CAP = 8
 
 # -------------------------
-# A compact Indian-flavored catalog with attributes: id, name, price (INR), category, color, sizes
-CATALOG = [
-    {
-        "id": "mug-001",
-        "name": "Stoneware Chai Mug",
-        "description": "Hand-glazed ceramic mug perfect for masala chai.",
-        "price": 299,
-        "currency": "INR",
-        "category": "mug",
-        "color": "blue",
-        "sizes": [],
-    },
-    {
-        "id": "tee-001",
-        "name": "Tee (Cotton)",
-        "description": "Comfort-fit cotton t-shirt with subtle logo.",
-        "price": 899,
-        "currency": "INR",
-        "category": "tshirt",
-        "color": "black",
-        "sizes": ["S", "M", "L", "XL"],
-    },
-    {
-        "id": "hoodie-001",
-        "name": "Cozy Hoodie",
-        "description": "Warm pullover hoodie, fleece-lined.",
-        "price": 1599,
-        "currency": "INR",
-        "category": "hoodie",
-        "color": "grey",
-        "sizes": ["M", "L", "XL"],
-    },
-    {
-        "id": "mug-002",
-        "name": "Insulated Travel Mug",
-        "description": "Keeps chai warm on your way to work.",
-        "price": 499,
-        "currency": "INR",
-        "category": "mug",
-        "color": "white",
-        "sizes": [],
-    },
-    {
-        "id": "hoodie-002",
-        "name": "Black Zip Hoodie",
-        "description": "Lightweight zip-up hoodie, black.",
-        "price": 1199,
-        "currency": "INR",
-        "category": "hoodie",
-        "color": "black",
-        "sizes": ["S", "M", "L"],
-    },
-    # T-shirts (expanded)
-    {
-        "id": "tee-002",
-        "name": "Casual Cotton Tee",
-        "description": "Everyday cotton t-shirt, breathable and soft.",
-        "price": 499,
-        "currency": "INR",
-        "category": "tshirt",
-        "color": "white",
-        "sizes": ["S", "M", "L", "XL"],
-    },
-    {
-        "id": "tee-003",
-        "name": "Graphic Tee",
-        "description": "Printed graphic t-shirt with vibrant design.",
-        "price": 399,
-        "currency": "INR",
-        "category": "tshirt",
-        "color": "navy",
-        "sizes": ["S", "M", "L", "XL"],
-    },
-    {
-        "id": "tee-004",
-        "name": "Premium Polo Tee",
-        "description": "Polo-style t-shirt with premium stitching.",
-        "price": 899,
-        "currency": "INR",
-        "category": "tshirt",
-        "color": "maroon",
-        "sizes": ["M", "L", "XL"],
-    },
-    {
-        "id": "tee-005",
-        "name": "Summer V-neck Tee",
-        "description": "Lightweight V-neck tee for hot days.",
-        "price": 450,
-        "currency": "INR",
-        "category": "tshirt",
-        "color": "sky",
-        "sizes": ["S", "M", "L"],
-    },
-    {
-        "id": "tee-006",
-        "name": "Henley Tee",
-        "description": "Smart casual henley style t-shirt.",
-        "price": 799,
-        "currency": "INR",
-        "category": "tshirt",
-        "color": "olive",
-        "sizes": ["M", "L", "XL"],
-    },
-    # Raincoats / Outerwear
-    {
-        "id": "rain-001",
-        "name": "Light Raincoat",
-        "description": "Waterproof light raincoat, packable.",
-        "price": 1199,
-        "currency": "INR",
-        "category": "raincoat",
-        "color": "yellow",
-        "sizes": ["M", "L", "XL"],
-    },
-    {
-        "id": "rain-002",
-        "name": "Heavy Duty Raincoat",
-        "description": "Heavy-duty rainproof coat for monsoon.",
-        "price": 2599,
-        "currency": "INR",
-        "category": "raincoat",
-        "color": "navy",
-        "sizes": ["L", "XL"],
-    },
-    # Laptops
-    {
-        "id": "laptop-001",
-        "name": "Generic Laptop (50k)",
-        "description": "A reliable laptop suitable for everyday use.",
-        "price": 50000,
-        "currency": "INR",
-        "category": "laptop",
-        "color": "silver",
-        "sizes": [],
-    },
-    {
-        "id": "laptop-002",
-        "name": "Dell Inspiron (Budget)",
-        "description": "Compact Dell laptop for students and professionals.",
-        "price": 27800,
-        "currency": "INR",
-        "category": "laptop",
-        "color": "black",
-        "sizes": [],
-    },
-    {
-        "id": "laptop-003",
-        "name": "Lenovo ThinkPad",
-        "description": "Durable Lenovo laptop with strong performance.",
-        "price": 60000,
-        "currency": "INR",
-        "category": "laptop",
-        "color": "black",
-        "sizes": [],
-    },
-    {
-        "id": "laptop-004",
-        "name": "HP Pavilion",
-        "description": "High-performance HP laptop for creators.",
-        "price": 100000,
-        "currency": "INR",
-        "category": "laptop",
-        "color": "silver",
-        "sizes": [],
-    },
-    # Storage
-    {
-        "id": "storage-001",
-        "name": "External Hard Disk 1TB",
-        "description": "Portable external hard disk for backups.",
-        "price": 50000,
-        "currency": "INR",
-        "category": "storage",
-        "color": "black",
-        "sizes": [],
-    },
-    # Mobile phones (10k - 50k examples)
-    {
-        "id": "phone-001",
-        "name": "Redmi Note (Entry)",
-        "description": "Affordable Redmi smartphone with solid features.",
-        "price": 12000,
-        "currency": "INR",
-        "category": "mobile",
-        "color": "blue",
-        "sizes": [],
-    },
-    {
-        "id": "phone-002",
-        "name": "Oppo A-Series",
-        "description": "Stylish Oppo phone with good camera.",
-        "price": 18000,
-        "currency": "INR",
-        "category": "mobile",
-        "color": "green",
-        "sizes": [],
-    },
-    {
-        "id": "phone-003",
-        "name": "Samsung M-Series",
-        "description": "Mid-range Samsung phone for everyday use.",
-        "price": 25000,
-        "currency": "INR",
-        "category": "mobile",
-        "color": "black",
-        "sizes": [],
-    },
-    {
-        "id": "phone-004",
-        "name": "iPhone (Standard)",
-        "description": "Apple iPhone model example (price varies by config).",
-        "price": 50000,
-        "currency": "INR",
-        "category": "mobile",
-        "color": "white",
-        "sizes": [],
-    },
-    {
-        "id": "phone-005",
-        "name": "Oppo Reno",
-        "description": "Higher-end Oppo phone with premium features.",
-        "price": 35000,
-        "currency": "INR",
-        "category": "mobile",
-        "color": "black",
-        "sizes": [],
-    },
-    {
-        "id": "phone-006",
-        "name": "Redmi Pro",
-        "description": "Redmi higher-tier phone with improved camera and battery.",
-        "price": 22000,
-        "currency": "INR",
-        "category": "mobile",
-        "color": "grey",
-        "sizes": [],
-    },
+# Constants & Patterns
+# -------------------------
+SCENARIOS = [
+    "You are a barista who has to tell a customer that their latte is actually a portal to another dimension.",
+    "You are a time-travelling tour guide explaining modern smartphones to someone from the 1800s.",
+    "You are a restaurant waiter who must calmly tell a customer that their order has escaped the kitchen.",
+    "You are a customer trying to return an obviously cursed object to a very skeptical shop owner.",
+    "You are an overenthusiastic TV infomercial host selling a product that clearly does not work as advertised.",
+    "You are an astronaut who just discovered the ship's coffee machine has developed a personality.",
+    "You are a nervous wedding officiant who keeps getting the couple's names mixed up in ridiculous ways.",
+    "You are a ghost trying to give a performance review to a living employee.",
+    "You are a medieval king reacting to a very modern delivery service showing up at court.",
+    "You are a detective interrogating a suspect who only answers in awkward metaphors."
 ]
 
-
-
-ORDERS_FILE = "orders.json"
-
-# ensure orders file exists
-if not os.path.exists(ORDERS_FILE):
-    with open(ORDERS_FILE, "w") as f:
-        json.dump([], f)
+# Precompile end-scene regex
+END_SCENE_PAT = re.compile(r"\b(?:" + "|".join([re.escape(x) for x in [
+    "end scene", "and scene", "scene end", "stop scene", "that's the scene",
+]]) + r")\b", flags=re.IGNORECASE)
 
 # -------------------------
-# Per-session Userdata (shopping-centric)
+# State Management
 # -------------------------
+def _now_ts() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
 @dataclass
 class Userdata:
-    player_name: Optional[str] = None  # retained name field (player -> customer)
+    player_name: Optional[str] = None
     session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-    cart: List[Dict] = field(default_factory=list)  # list of {product_id, quantity, attrs}
-    orders: List[Dict] = field(default_factory=list)  # orders placed in this session
-    history: List[Dict] = field(default_factory=list)  # conversational actions for trace
-
-# -------------------------
-# Merchant-layer helpers (ACP-inspired mini layer)
-# -------------------------
-
-def _load_all_orders() -> List[Dict]:
-    try:
-        with open(ORDERS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def _save_order(order: Dict):
-    orders = _load_all_orders()
-    orders.append(order)
-    with open(ORDERS_FILE, "w") as f:
-        json.dump(orders, f, indent=2)
-
-
-def list_products(filters: Optional[Dict] = None) -> List[Dict]:
-    """Naive filtering by category, max_price, color, size substring, or query words.
-
-    Improvements:
-    - Accepts category synonyms (e.g., 'phone', 'mobile', 'phones' -> 'mobile').
-    - Supports a flexible max_price and min_price (if provided in filters).
-    - Matches category by substring if exact match fails.
-    """
-    filters = filters or {}
-    results = []
-    query = filters.get("q")
-    category = filters.get("category")
-    max_price = filters.get("max_price") or filters.get("to") or filters.get("max")
-    min_price = filters.get("min_price") or filters.get("from") or filters.get("min")
-    color = filters.get("color")
-    size = filters.get("size")
-
-    # normalize category synonyms
-    if category:
-        cat = category.lower()
-        if cat in ("phone", "phones", "mobile", "mobile phone", "mobiles"):
-            category = "mobile"
-        elif cat in ("tshirt", "t-shirts", "tees", "tee"):
-            category = "tshirt"
-        else:
-            category = cat
-
-    for p in CATALOG:
-        ok = True
-        # category matching: allow substring matches if direct equality fails
-        if category:
-            pcat = p.get("category", "").lower()
-            if pcat != category and category not in pcat and pcat not in category:
-                ok = False
-        if max_price:
-            try:
-                if p.get("price", 0) > int(max_price):
-                    ok = False
-            except Exception:
-                pass
-        if min_price:
-            try:
-                if p.get("price", 0) < int(min_price):
-                    ok = False
-            except Exception:
-                pass
-        if color and p.get("color") and p.get("color") != color:
-            ok = False
-        if size and (not p.get("sizes") or size not in p.get("sizes")):
-            ok = False
-        if query:
-            q = query.lower()
-            # if query mentions 'phone' or 'mobile', accept mobile category too
-            if "phone" in q or "mobile" in q:
-                if p.get("category") != "mobile":
-                    ok = False
-            else:
-                if q not in p.get("name", "").lower() and q not in p.get("description", "").lower():
-                    ok = False
-        if ok:
-            results.append(p)
-    return results
-
-
-def find_product_by_ref(ref_text: str, candidates: Optional[List[Dict]] = None) -> Optional[Dict]:
-    """Resolve references like 'second hoodie' or 'black hoodie' to a product dict.
-    Heuristics improved:
-    - Handle ordinals like 'first/second/third' within a filtered candidate list.
-    - If ref mentions 'phone' or 'mobile' prefer mobile category products.
-    - Match by id, color+category, name substring, or numeric index.
-    """
-    ref = (ref_text or "").lower().strip()
-    cand = candidates if candidates is not None else CATALOG
-
-    # prefer mobiles if user explicitly mentions phone/mobile
-    wants_mobile = any(w in ref for w in ("phone", "phones", "mobile", "mobiles"))
-    filtered = cand
-    if wants_mobile:
-        filtered = [p for p in cand if p.get("category") == "mobile"]
-        if not filtered:
-            filtered = cand
-
-    # ordinal handling
-    ordinals = {"first": 0, "second": 1, "third": 2, "fourth": 3}
-    for word, idx in ordinals.items():
-        if word in ref:
-            if idx < len(filtered):
-                return filtered[idx]
-
-    # direct id match
-    for p in cand:
-        if p["id"].lower() == ref:
-            return p
-
-    # color + category matching
-    for p in cand:
-        if p.get("color") and p["color"] in ref and p.get("category") and p["category"] in ref:
-            return p
-
-    # name substring or keywords
-    for p in filtered:
-        name = p["name"].lower()
-        if all(tok in name for tok in ref.split() if len(tok) > 2):
-            return p
-    for p in cand:
-        for tok in ref.split():
-            if len(tok) > 2 and tok in p["name"].lower():
-                return p
-
-    # numeric index like '2' -> second
-    for token in ref.split():
-        if token.isdigit():
-            idx = int(token) - 1
-            if 0 <= idx < len(filtered):
-                return filtered[idx]
-
-    # fallback: if user said 'second phone' but we couldn't match earlier, try overall cand ordinals
-    for word, idx in ordinals.items():
-        if word in ref and idx < len(cand):
-            return cand[idx]
-
-    return None
-
-
-@function_tool
-async def show_catalog(
-    ctx: RunContext[Userdata],
-    q: Annotated[Optional[str], Field(description="Search query (optional)", default=None)] = None,
-    category: Annotated[Optional[str], Field(description="Category (optional)", default=None)] = None,
-    max_price: Annotated[Optional[int], Field(description="Maximum price (optional)", default=None)] = None,
-    color: Annotated[Optional[str], Field(description="Color (optional)", default=None)] = None,
-) -> str:
-    """Return a short spoken summary of matching products (name, price, id).
-    Improvements:
-    - Recognize category synonyms like 'phones' and 'tees'.
-    - Return up to 8 items and explicitly call out mobiles if present.
-    """
-    userdata = ctx.userdata
-    # try to normalize category input
-    if category:
-        cat = category.lower()
-        if cat in ("phone", "phones", "mobile", "mobile phone", "mobiles"):
-            category = "mobile"
-        elif cat in ("tshirt", "t-shirts", "tees", "tee"):
-            category = "tshirt"
-        else:
-            category = cat
-    # If query mentions phones, prefer category mobile
-    if not category and q:
-        if any(w in q.lower() for w in ("phone", "phones", "mobile", "mobiles")):
-            category = "mobile"
-        if any(w in q.lower() for w in ("tee", "tshirt", "t-shirts", "tees")):
-            category = "tshirt"
-
-    filters = {"q": q, "category": category, "max_price": max_price, "color": color}
-    prods = list_products({k: v for k, v in filters.items() if v is not None})
-    if not prods:
-        return "Sorry — I couldn't find any items that match. Would you like to try another search?"
-    # Summarize top 8
-    lines = [f"Here are the top {min(8, len(prods))} items I found at Alpha Shop:"]
-    for idx, p in enumerate(prods[:8], start=1):
-        size_info = f" (sizes: {', '.join(p['sizes'])})" if p.get('sizes') else ""
-        lines.append(f"{idx}. {p['name']} — {p['price']} {p['currency']} (id: {p['id']}){size_info}")
-    lines.append("You can say: 'I want the second item in size M' or 'add mug-001 to my cart, quantity 2'.")
-    # If mobiles were in results, add a short phrasing hint
-    if any(p.get('category') == 'mobile' for p in prods):
-        lines.append("To buy a phone say: 'Add phone-002 to my cart' or 'I want the second phone, quantity 1'.")
-    return "\n".join(lines)
-
-
-def find_product_by_ref(ref_text: str, candidates: Optional[List[Dict]] = None) -> Optional[Dict]:
-    """Resolve references like 'second hoodie' or 'black hoodie' to a product dict.
-    Very simple heuristic: look for ordinal words, color or exact id/name matching.
-    """
-    ref = (ref_text or "").lower().strip()
-    cand = candidates if candidates is not None else CATALOG
-
-    # ordinal handling
-    ordinals = {"first": 0, "second": 1, "third": 2}
-    for word, idx in ordinals.items():
-        if word in ref:
-            if idx < len(cand):
-                return cand[idx]
-
-    # direct id match
-    for p in cand:
-        if p["id"].lower() == ref:
-            return p
-
-    # color + category matching
-    for p in cand:
-        if p.get("color") and p["color"] in ref and p.get("category") and p["category"] in ref:
-            return p
-
-    # name substring
-    for p in cand:
-        if p["name"].lower() in ref or any(w in p["name"].lower() for w in ref.split()):
-            return p
-
-    # fallback: if a number present, try to parse as '2nd of last list'
-    for token in ref.split():
-        if token.isdigit():
-            idx = int(token) - 1
-            if 0 <= idx < len(cand):
-                return cand[idx]
-
-    return None
-
-
-def create_order_object(line_items: List[Dict], currency: str = "INR") -> Dict:
-    """line_items: [{product_id, quantity, attrs}]
-    Returns an order dict (id, items, total, currency, created_at)
-    """
-    items = []
-    total = 0
-    for li in line_items:
-        pid = li.get("product_id")
-        qty = int(li.get("quantity", 1))
-        prod = next((p for p in CATALOG if p["id"] == pid), None)
-        if not prod:
-            raise ValueError(f"Product {pid} not found")
-        line_total = prod["price"] * qty
-        total += line_total
-        items.append({
-            "product_id": pid,
-            "name": prod["name"],
-            "unit_price": prod["price"],
-            "quantity": qty,
-            "line_total": line_total,
-            "attrs": li.get("attrs", {}),
-        })
-    order = {
-        "id": f"order-{str(uuid.uuid4())[:8]}",
-        "items": items,
-        "total": total,
-        "currency": currency,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-    }
-    # persist
-    _save_order(order)
-    return order
-
-
-def get_most_recent_order() -> Optional[Dict]:
-    all_orders = _load_all_orders()
-    if not all_orders:
-        return None
-    return all_orders[-1]
-
-# -------------------------
-# Agent Tools (function_tool) exposed to the LLM layer
-# -------------------------
-
-@function_tool
-async def show_catalog(
-    ctx: RunContext[Userdata],
-    q: Annotated[Optional[str], Field(description="Search query (optional)", default=None)] = None,
-    category: Annotated[Optional[str], Field(description="Category (optional)", default=None)] = None,
-    max_price: Annotated[Optional[int], Field(description="Maximum price (optional)", default=None)] = None,
-    color: Annotated[Optional[str], Field(description="Color (optional)", default=None)] = None,
-) -> str:
-    """Return a short spoken summary of matching products (name, price, id)."""
-    userdata = ctx.userdata
-    filters = {"q": q, "category": category, "max_price": max_price, "color": color}
-    prods = list_products({k: v for k, v in filters.items() if v is not None})
-    if not prods:
-        return "Sorry — I couldn't find any items that match. Would you like to try another search?"
-    # Summarize top 4
-    lines = [f"Here are the top {min(4, len(prods))} items I found at Alpha Shop:"]
-    for idx, p in enumerate(prods[:4], start=1):
-        lines.append(f"{idx}. {p['name']} — {p['price']} {p['currency']} (id: {p['id']})")
-    lines.append("You can say: 'I want the second item in size M' or 'add mug-001 to my cart, quantity 2'.")
-    return "\n".join(lines)
-
-
-@function_tool
-async def add_to_cart(
-    ctx: RunContext[Userdata],
-    product_ref: Annotated[str, Field(description="Reference to product: id, name, or spoken ref")] ,
-    quantity: Annotated[int, Field(description="Quantity", default=1)] = 1,
-    size: Annotated[Optional[str], Field(description="Size (optional)", default=None)] = None,
-) -> str:
-    """Resolve a product and add to the session cart."""
-    userdata = ctx.userdata
-    # take recent catalog as candidates
-    candidates = CATALOG
-    prod = find_product_by_ref(product_ref, candidates)
-    if not prod:
-        return "I couldn't resolve which product you meant. Try using the item id or say 'show catalog' to hear options.'"
-    userdata.cart.append({
-        "product_id": prod["id"],
-        "quantity": int(quantity),
-        "attrs": {"size": size} if size else {},
+    started_at: str = field(default_factory=_now_ts)
+    improv_state: Dict = field(default_factory=lambda: {
+        "current_round": 0,
+        "max_rounds": DEFAULT_MAX_ROUNDS,
+        "rounds": [],
+        "phase": "idle", # "intro", "awaiting_improv", "reacting", "done"
+        "used_indices": [],
+        "current_scenario": None
     })
-    userdata.history.append({
-        "time": datetime.utcnow().isoformat() + "Z",
-        "action": "add_to_cart",
-        "product_id": prod["id"],
-        "quantity": int(quantity),
-    })
-    return f"Added {quantity} x {prod['name']} to your cart. What would you like to do next?"
+    history: List[Dict] = field(default_factory=list)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
+# -------------------------
+# Helpers
+# -------------------------
+def _sanitize_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
 
-@function_tool
-async def show_cart(
-    ctx: RunContext[Userdata],
-) -> str:
-    userdata = ctx.userdata
-    if not userdata.cart:
-        return "Your cart is empty. You can say 'show catalog' to browse items.'"
-    lines = ["Items in your cart:"]
-    total = 0
-    for li in userdata.cart:
-        p = next((x for x in CATALOG if x["id"] == li["product_id"]), None)
-        if not p:
-            continue
-        line_total = p["price"] * li.get("quantity", 1)
-        total += line_total
-        sz = li.get("attrs", {}).get("size")
-        sz_text = f", size {sz}" if sz else ""
-        lines.append(f"- {p['name']} x {li['quantity']}{sz_text}: {line_total} INR")
-    lines.append(f"Cart total: {total} INR")
-    lines.append("Say 'place my order' to checkout or 'clear cart' to empty the cart.")
-    return "\n".join(lines)
+def _pick_scenario(userdata: Userdata) -> str:
+    used = userdata.improv_state.get("used_indices", [])
+    candidates = [i for i in range(len(SCENARIOS)) if i not in used]
+    
+    if not candidates:
+        userdata.improv_state["used_indices"] = []
+        candidates = list(range(len(SCENARIOS)))
+    
+    idx = secrets.choice(candidates)
+    userdata.improv_state["used_indices"].append(idx)
+    scenario = SCENARIOS[idx]
+    userdata.improv_state["current_scenario"] = scenario
+    return scenario
 
+def _clean_performance_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = END_SCENE_PAT.sub("", text)
+    cleaned = _sanitize_text(cleaned)
+    MAX_PERF_CHARS = 2000
+    if len(cleaned) > MAX_PERF_CHARS:
+        cleaned = cleaned[:MAX_PERF_CHARS-3] + "..."
+    return cleaned
 
-@function_tool
-async def clear_cart(
-    ctx: RunContext[Userdata],
-) -> str:
-    userdata = ctx.userdata
-    userdata.cart = []
-    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "clear_cart"})
-    return "Your cart has been cleared. What would you like to do next?"
+def _generate_reaction(performance: str) -> str:
+    # 5. Empty Input Guard
+    if not performance or not performance.strip():
+        return "Nice start — I didn't catch many words there. Try leaning into one clear choice next time."
 
+    p_lower = performance.lower()
+    
+    # Simple Vibe Detection
+    vibe = "neutral"
+    if any(w in p_lower for w in ["haha", "lol", "funny", "joke", "laugh"]):
+        vibe = "comedic"
+    elif any(w in p_lower for w in ["sad", "cry", "sorry", "tragic", "tears"]):
+        vibe = "dramatic"
+    elif any(w in p_lower for w in ["wait", "um", "uh", "pause", "..."]):
+        vibe = "hesitant"
+    elif len(performance.split()) < 5:
+        vibe = "short"
 
-@function_tool
-async def place_order(
-    ctx: RunContext[Userdata],
-    confirm: Annotated[bool, Field(description="Confirm order placement", default=True)] = True,
-) -> str:
-    """Create order from session cart and persist. Returns order summary."""
-    userdata = ctx.userdata
-    if not userdata.cart:
-        return "Your cart is empty — nothing to place. Would you like to browse items?"
-    # Build line_items
-    line_items = []
-    for li in userdata.cart:
-        line_items.append({
-            "product_id": li["product_id"],
-            "quantity": li.get("quantity", 1),
-            "attrs": li.get("attrs", {}),
-        })
-    order = create_order_object(line_items)
-    userdata.orders.append(order)
-    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "place_order", "order_id": order["id"]})
-    # clear cart after order
-    userdata.cart = []
-    return f"Order placed. Order ID {order['id']}. Total {order['total']} {order['currency']}. What would you like to do next?"
+    # 7. Secure Randomness
+    r = secrets.randbelow(100) / 100.0
+    
+    # 50% Supportive
+    if r < 0.5:
+        if vibe == "comedic":
+            return "Ha! That was genuinely funny. Great timing on the punchline."
+        elif vibe == "dramatic":
+            return "Wow — you actually made that surprisingly emotional. Good commitment."
+        elif vibe == "short":
+            return "Short and punchy — works well!"
+        else:
+            return "I love the energy — clear choices and commitment."
+            
+    # 30% Neutral/Witty
+    elif r < 0.8:
+        if vibe == "hesitant":
+            return "I could feel the gears turning there — interesting choices."
+        elif vibe == "comedic":
+            return "A bit absurd, and I think that helped this scene."
+        else:
+            return "Interesting take — I didn't expect that turn."
+            
+    # 20% Constructive Critique
+    else:
+        if vibe == "short":
+            return "That felt a little rushed — let the moment breathe more next time."
+        elif vibe == "hesitant":
+            return "You seemed unsure in places — trust your first impulse."
+        else:
+            return "Good start; try raising the stakes more for clearer beats."
 
-
-@function_tool
-async def last_order(
-    ctx: RunContext[Userdata],
-) -> str:
-    ord = get_most_recent_order()
-    if not ord:
-        return "You have no past orders yet."
-    lines = [f"Most recent order: {ord['id']} — {ord['created_at']}"]
-    for it in ord['items']:
-        lines.append(f"- {it['name']} x {it['quantity']}: {it['line_total']} {ord['currency']}")
-    lines.append(f"Total: {ord['total']} {ord['currency']}")
+def _build_summary(userdata: Userdata) -> str:
+    rounds = userdata.improv_state.get("rounds", [])
+    if not rounds:
+        return "No rounds were played. Maybe next time!"
+        
+    lines = [f"Thanks for playing, {userdata.player_name or 'Contestant'}! Quick recap:"]
+    
+    for r in rounds:
+        perf = (r.get("performance") or "").strip()
+        perf_snip = perf if len(perf) <= 80 else perf[:77] + "..."
+        lines.append(f"Round {r['round']}: {r['scenario']} — You: '{perf_snip}' | Host: {r['reaction']}")
+        
+    long_scenes = sum(1 for r in rounds if len((r.get("performance") or "").split()) > 20)
+    
+    if long_scenes == len(rounds):
+        profile = "verbose and detailed"
+    elif long_scenes == 0:
+        profile = "concise and punchy"
+    else:
+        profile = "balanced"
+        
+    lines.append(f"You performed as a {profile} improviser. Keep leaning into clear choices.")
+    userdata.history.append({"time": _now_ts(), "action": "summarize_show"})
+    
     return "\n".join(lines)
 
 # -------------------------
-# The Agent (Badal Bhai)
+# Agent Tools
+# -------------------------
+
+@function_tool
+async def start_show(
+    ctx: RunContext[Userdata],
+    name: Annotated[Optional[str], Field(description="Player name", default=None)] = None,
+    max_rounds: Annotated[int, Field(description="Number of rounds (1-8)", default=3)] = 3,
+) -> str:
+    """Initialize the game state, introduce the host, and start Round 1."""
+    userdata = ctx.userdata
+    async with userdata.lock:
+        if name:
+            userdata.player_name = _sanitize_text(name)
+        userdata.player_name = userdata.player_name or "Contestant"
+        
+        try:
+            m_rounds = int(max_rounds)
+        except Exception:
+            m_rounds = DEFAULT_MAX_ROUNDS
+        m_rounds = max(1, min(m_rounds, MAX_ROUNDS_CAP))
+        
+        userdata.improv_state.update({
+            "max_rounds": m_rounds,
+            "current_round": 1,
+            "rounds": [],
+            "phase": "awaiting_improv",
+            "used_indices": []
+        })
+        
+        scenario = _pick_scenario(userdata)
+        userdata.history.append({"time": _now_ts(), "action": "start_show", "round": 1, "scenario": scenario})
+        
+        intro_text = (
+            f"Welcome to Improv Battle! I'm your host. "
+            f"{userdata.player_name}, we'll play {m_rounds} rounds. "
+            "When you are done with a scene say 'End scene' or pause. "
+            f"Round 1: {scenario}. Action!"
+        )
+        logger.info("Session %s started for %s (rounds=%d)", userdata.session_id, userdata.player_name, m_rounds)
+        return intro_text
+
+@function_tool
+async def next_scenario(ctx: RunContext[Userdata]) -> str:
+    """Moves to the next round if available, or ends the show."""
+    userdata = ctx.userdata
+    async with userdata.lock:
+        state = userdata.improv_state
+        if state["phase"] == "done":
+            return "The show is already over. Say 'start show' to play again."
+            
+        cur = int(state.get("current_round", 0))
+        maxr = int(state.get("max_rounds", DEFAULT_MAX_ROUNDS))
+        
+        if cur >= maxr:
+            state["phase"] = "done"
+            return _build_summary(userdata)
+            
+        next_round = cur + 1
+        scenario = _pick_scenario(userdata)
+        state["current_round"] = next_round
+        state["phase"] = "awaiting_improv"
+        
+        userdata.history.append({"time": _now_ts(), "action": "next_scenario", "round": next_round, "scenario": scenario})
+        logger.info("Session %s advancing to round %d", userdata.session_id, next_round)
+        
+        return f"Round {next_round}: {scenario}. Go!"
+
+@function_tool
+async def record_performance(
+    ctx: RunContext[Userdata],
+    performance: Annotated[str, Field(description="The user's acted out speech")],
+) -> str:
+    """
+    Saves the user's performance, generates a host reaction, 
+    and checks if the game should end or continue.
+    """
+    userdata = ctx.userdata
+    async with userdata.lock:
+        state = userdata.improv_state
+        perf = _clean_performance_text(performance)
+        round_num = int(state.get("current_round", 0))
+        scenario = state.get("current_scenario") or "(unknown)"
+        
+        reaction = _generate_reaction(perf)
+        
+        state["rounds"].append({
+            "round": round_num,
+            "scenario": scenario,
+            "performance": perf,
+            "reaction": reaction,
+            "ts": _now_ts()
+        })
+        
+        state["phase"] = "reacting"
+        userdata.history.append({"time": _now_ts(), "action": "record_performance", "round": round_num})
+        logger.info("Session %s recorded performance for round %d (len=%d)", userdata.session_id, round_num, len(perf))
+        
+        if round_num >= int(state.get("max_rounds", DEFAULT_MAX_ROUNDS)):
+            state["phase"] = "done"
+            summary = _build_summary(userdata)
+            return f"{reaction}\n\nThat was the final round! {summary}"
+            
+        return f"{reaction}\n\nWhen you're ready say 'Next' or 'Ready'."
+
+@function_tool
+async def summarize_show(ctx: RunContext[Userdata]) -> str:
+    """Generates a final summary of the player's style."""
+    userdata = ctx.userdata
+    async with userdata.lock:
+        return _build_summary(userdata)
+
+@function_tool
+async def stop_show(
+    ctx: RunContext[Userdata],
+    confirm: Annotated[bool, Field(description="Must be True to exit")] = False
+) -> str:
+    """Ends the game early."""
+    userdata = ctx.userdata
+    async with userdata.lock:
+        if not confirm:
+            return "Are you sure you want to end the show early? Say 'Yes' to confirm."
+        
+        userdata.improv_state["phase"] = "done"
+        userdata.history.append({"time": _now_ts(), "action": "stop_show"})
+        logger.info("Session %s stopped by user", userdata.session_id)
+        return "Okay — show ended. Thanks for playing!"
+
+@function_tool
+async def get_game_state(ctx: RunContext[Userdata]) -> str:
+    """Debug tool for the LLM to check current round/phase."""
+    s = ctx.userdata.improv_state
+    return f"Round: {s['current_round']}/{s['max_rounds']}, Phase: {s['phase']}, Scenario: {s.get('current_scenario')}"
+
+# -------------------------
+# Agent Definition
 # -------------------------
 class GameMasterAgent(Agent):
     def __init__(self):
-        # System instructions now describe the shopkeeper persona and commerce role
         instructions = """
-        You are 'Badal Bhai', the friendly shopkeeper and voice assistant for Alpha Shop.
-        Universe: A small neighbourhood Indian shop selling mugs, hoodies and tees.
-        Tone: Warm, helpful, slightly jocular; keep sentences short for TTS clarity.
-        Role: Help the customer browse the catalog, add items to cart, place orders, and review recent orders.
-
-        Rules:
-            - Use the provided tools to show the catalog, add items to cart, show the cart, place orders, show last order and clear the cart.
-            - Keep continuity using the per-session userdata. Mention cart contents if relevant.
-            - Drive short voice-first turns suitable for spoken delivery.
-            - When presenting options, include product id and price (e.g. 'mug-001 — 299 INR').
+        You are the host of "Improv Battle", a fast-paced voice-only improv game show.
+        
+        YOUR ROLE:
+        - High-energy, witty, slightly sarcastic but supportive TV host.
+        - Your goal is to keep the show moving briskly.
+        
+        FLOW:
+        1. **Intro**: Use `start_show` to welcome the player and give the first scenario.
+        2. **Listening**: When the player acts, wait for them to finish. 
+           - If they say "End Scene", call `record_performance`.
+           - If they pause for a long time, call `record_performance`.
+        3. **Reacting**: `record_performance` will return your reaction text. Read it with character.
+        4. **Next**: Ask if they are ready, then call `next_scenario`.
+        5. **End**: `summarize_show` is called automatically after the last round.
+        
+        CRITICAL RULES:
+        - DO NOT make up your own scenarios. ALWAYS use the tools.
+        - DO NOT interrupt the player while they are acting.
+        - If the player says "Stop" or "Quit", use `stop_show`.
         """
         super().__init__(
             instructions=instructions,
-            tools=[show_catalog, add_to_cart, show_cart, clear_cart, place_order, last_order],
+            tools=[
+                start_show, 
+                next_scenario, 
+                record_performance, 
+                summarize_show, 
+                stop_show,
+                get_game_state
+            ],
         )
 
 # -------------------------
-# Entrypoint & Prewarm (keeps speech functionality untouched)
+# Main Execution
 # -------------------------
 def prewarm(proc: JobProcess):
-    # load VAD model and stash on process userdata, try/catch like original file
+    # 2. Log exceptions in prewarm
     try:
         proc.userdata["vad"] = silero.VAD.load()
-    except Exception:
-        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
-
+        logger.info("VAD successfully prewarmed")
+    except Exception as e:
+        logger.exception("VAD prewarm failed; continuing without preloaded VAD: %s", e)
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-    logger.info("\n" + "🛍️" * 6)
-    logger.info("🚀 STARTING VOICE E-COMMERCE AGENT (Alpha Shop) — Badal Bhai")
+    logger.info("🚀 STARTING IMPROV BATTLE HOST AGENT")
 
     userdata = Userdata()
 
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(model="gemini-2.5-flash"),
+        stt=deepgram.STT(model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3")),
+        llm=google.LLM(model=os.getenv("GOOGLE_LLM_MODEL", "gemini-2.5-flash")),
         tts=murf.TTS(
-            voice="en-US-marcus",
-            style="Conversational",
+            voice=os.getenv("MURF_VOICE", "en-US-marcus"),
+            style=os.getenv("MURF_STYLE", "Conversational"),
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
@@ -744,15 +413,26 @@ async def entrypoint(ctx: JobContext):
         userdata=userdata,
     )
 
-    # Start the agent session with the GameMasterAgent (Badal Bhai)
-    await session.start(
-        agent=GameMasterAgent(),
-        room=ctx.room,
-        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
-    )
+    # 3. Wrap session.start in try/except
+    try:
+        await session.start(
+            agent=GameMasterAgent(),
+            room=ctx.room,
+            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
+        )
+    except Exception as e:
+        logger.exception("Failed to start session: %s", e)
+        raise
 
     await ctx.connect()
 
-
+# 6. Basic shutdown cleanup logger
+def _on_shutdown(*args):
+    logger.info("Worker shutting down: cleaning up resources...")
+    # Add any specific cleanup logic here if needed (e.g., closing DB connections)
+    
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _on_shutdown)
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
